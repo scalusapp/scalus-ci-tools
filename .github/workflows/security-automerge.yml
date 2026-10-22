@@ -5,6 +5,7 @@
 #   Merged: patch and minor upgrades.
 #   Left open for a person: major upgrades, @capacitor/* and @capawesome/* (native app, needs a
 #   store build), a failed or missing Vercel build. Scalus Security shows anything left open.
+# Callers grant contents: write, pull-requests: write, statuses: read, checks: read.
 # Kill switch for every repo at once: add a file named AUTOMERGE_OFF to the root of this repo.
 name: security-automerge
 on:
@@ -39,8 +40,8 @@ jobs:
             note "touches the native app ($NAMES), needs a store build, left for a person."; exit 0; fi
           # Vercel reports on the commit as a status ("Vercel") or a check run ("Vercel ...").
           for i in $(seq 1 60); do
-            st=$(gh api "repos/$REPO/commits/$SHA/statuses" --jq '[.[]|select(.context|test("^Vercel";"i"))][0].state // ""')
-            ck=$(gh api "repos/$REPO/commits/$SHA/check-runs" --jq '[.check_runs[]|select(.name|test("^Vercel";"i"))]|if length==0 then "" elif any(.conclusion=="failure" or .conclusion=="cancelled" or .conclusion=="timed_out") then "failure" elif all(.status=="completed") then "success" else "pending" end')
+            st=$(gh api "repos/$REPO/commits/$SHA/statuses" --jq '[.[]|select(.context|test("^Vercel";"i"))][0].state // ""') || { note "could not read the build status (the caller needs statuses: read and checks: read), left for a person."; exit 1; }
+            ck=$(gh api "repos/$REPO/commits/$SHA/check-runs" --jq '[.check_runs[]|select(.name|test("^Vercel";"i"))]|if length==0 then "" elif any(.conclusion=="failure" or .conclusion=="cancelled" or .conclusion=="timed_out") then "failure" elif all(.status=="completed") then "success" else "pending" end') || ck=""
             s="${st:-$ck}"
             [ "$st" = failure ] || [ "$st" = error ] || [ "$ck" = failure ] && { note "the Vercel preview build failed, left for a person."; exit 0; }
             [ "$s" = success ] && break
