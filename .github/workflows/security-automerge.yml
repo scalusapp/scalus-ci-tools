@@ -1,0 +1,51 @@
+# Security auto-merge (22 Oct 2026). Every Scalus repo with npm packages calls this from its own
+# .github/workflows/security-automerge.yml. Dependabot opens a pull request when GitHub publishes
+# an advisory for a package we use; this merges it once the Vercel preview of that exact commit
+# has built, so the fix goes live by itself.
+#   Merged: patch and minor upgrades.
+#   Left open for a person: major upgrades, @capacitor/* and @capawesome/* (native app, needs a
+#   store build), a failed or missing Vercel build. Scalus Security shows anything left open.
+# Kill switch for every repo at once: add a file named AUTOMERGE_OFF to the root of this repo.
+name: security-automerge
+on:
+  workflow_call:
+jobs:
+  merge:
+    runs-on: ubuntu-latest
+    timeout-minutes: 35
+    steps:
+      - id: meta
+        uses: dependabot/fetch-metadata@25dd0e34f4fe68f24cc83900b1fe3fe149efef98 # v3.1.0
+        with:
+          github-token: ${{ github.token }}
+      - name: Wait for the Vercel build, then merge
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+          PR: ${{ github.event.pull_request.number }}
+          SHA: ${{ github.event.pull_request.head.sha }}
+          UPDATE_TYPE: ${{ steps.meta.outputs.update-type }}
+          NAMES: ${{ steps.meta.outputs.dependency-names }}
+        run: |
+          set -u
+          note() { gh pr comment "$PR" --repo "$REPO" --body "Security auto-merge: $1" >/dev/null || true; echo "$1"; }
+          if gh api repos/scalusapp/scalus-ci-tools/contents/AUTOMERGE_OFF >/dev/null 2>&1; then
+            note "switched off (AUTOMERGE_OFF in scalus-ci-tools), left for a person."; exit 0; fi
+          case "$UPDATE_TYPE" in
+            version-update:semver-patch|version-update:semver-minor) ;;
+            *) note "\`$UPDATE_TYPE\` ($NAMES) is not a patch or minor upgrade, left for a person."; exit 0 ;;
+          esac
+          if echo "$NAMES" | tr ',' '\n' | grep -qE '^ *@(capacitor|capawesome)/'; then
+            note "touches the native app ($NAMES), needs a store build, left for a person."; exit 0; fi
+          # Vercel reports on the commit as a status ("Vercel") or a check run ("Vercel ...").
+          for i in $(seq 1 60); do
+            st=$(gh api "repos/$REPO/commits/$SHA/statuses" --jq '[.[]|select(.context|test("^Vercel";"i"))][0].state // ""')
+            ck=$(gh api "repos/$REPO/commits/$SHA/check-runs" --jq '[.check_runs[]|select(.name|test("^Vercel";"i"))]|if length==0 then "" elif any(.conclusion=="failure" or .conclusion=="cancelled" or .conclusion=="timed_out") then "failure" elif all(.status=="completed") then "success" else "pending" end')
+            s="${st:-$ck}"
+            [ "$st" = failure ] || [ "$st" = error ] || [ "$ck" = failure ] && { note "the Vercel preview build failed, left for a person."; exit 0; }
+            [ "$s" = success ] && break
+            sleep 30
+          done
+          [ "${s:-}" = success ] || { note "no Vercel build result after 30 minutes, left for a person."; exit 0; }
+          gh pr merge "$PR" --repo "$REPO" --squash --delete-branch --match-head-commit "$SHA" \
+            && echo "merged $NAMES ($UPDATE_TYPE)"

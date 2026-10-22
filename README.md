@@ -48,3 +48,7 @@ instead, where the deviation stays visible.
 
 `self-test/index.html` is a deliberately clean page. Serve it and run the gates
 against it: if that fails, the gates have regressed, not the site under test.
+
+## Security auto-merge
+
+`.github/workflows/security-automerge.yml` is called by each Scalus repo with npm packages. When Dependabot opens a security fix, it waits for the Vercel preview of that commit to build and then merges it. Patch and minor upgrades only. Native app packages and failed builds are left open for a person. To switch it off everywhere, add a file named `AUTOMERGE_OFF` at the root of this repo.
