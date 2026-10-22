@@ -51,4 +51,4 @@ against it: if that fails, the gates have regressed, not the site under test.
 
 ## Security auto-merge
 
-`.github/workflows/security-automerge.yml` is called by each Scalus repo with npm packages. When Dependabot opens a security fix, it waits for the Vercel preview of that commit to build and then merges it. Patch and minor upgrades only. Native app packages and failed builds are left open for a person. To switch it off everywhere, add a file named `AUTOMERGE_OFF` at the root of this repo.
+`.github/workflows/security-automerge.yml` is called by each Scalus repo with npm packages that ships from main. When Dependabot opens a security fix, it builds the PR in a read only job, checks that the live site is a git build main already contains (Vercel API, Dependabot secrets), and merges it. Patch and minor upgrades only. Native app packages, failed builds and sites deployed by hand are left open for a person. Vercel previews are skipped for Dependabot commits (each project's Ignored Build Step), so they never queue ahead of real deploys. To switch it off everywhere, add a file named `AUTOMERGE_OFF` at the root of this repo.

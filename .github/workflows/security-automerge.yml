@@ -1,14 +1,21 @@
-# Security auto-merge (22 Oct 2026). Every Scalus repo with npm packages calls this from its own
-# .github/workflows/security-automerge.yml. Dependabot opens a pull request when GitHub publishes
-# an advisory for a package we use; this merges it once the Vercel preview of that exact commit
-# has built, so the fix goes live by itself.
-#   Merged: patch and minor upgrades.
+# Security auto-merge (22 Oct 2026). Every Scalus repo with npm packages that ships from main calls
+# this from its own .github/workflows/security-automerge.yml. Dependabot opens a pull request when
+# GitHub publishes an advisory for a package we use; this builds it, checks the live site, and
+# merges it, so the fix goes live by itself.
+#   Merged: patch and minor upgrades, once `npm ci` and the build pass here.
 #   Only when the live site is a git build of a commit main already contains. A site last deployed
 #   by hand, or live ahead of main, is never touched: merging would put old main live (22 Oct 2026,
 #   a push to a stale main took HQ and scalus.app's booking engine down for up to 30 minutes).
 #   Left open for a person: major upgrades, @capacitor/* and @capawesome/* (native app, needs a
-#   store build), a failed or missing Vercel build. Scalus Security shows anything left open.
-# Callers grant contents: write, pull-requests: write, statuses: read, checks: read.
+#   store build), a failed build, a live site that is not on main. Scalus Security shows anything
+#   left open.
+# The build runs here, not as a Vercel preview: the Scalus team builds one deployment at a time on
+# Vercel, and a wave of Dependabot previews queued every production deploy behind them. Each Vercel
+# project skips previews whose commit author is dependabot[bot] (Ignored Build Step).
+# The build job is read only with no secrets, because `npm ci` runs the new packages' install
+# scripts. Only the merge job can write, and it never checks out or runs the PR's code.
+# Callers grant contents: write, pull-requests: write, and pass `secrets: inherit` (Dependabot
+# secrets VERCEL_AUTOMERGE_TOKEN, VERCEL_PROJECT, VERCEL_TEAM).
 # Kill switch for every repo at once: add a file named AUTOMERGE_OFF to the root of this repo.
 name: security-automerge
 on:
@@ -21,47 +28,85 @@ on:
       VERCEL_TEAM:
         required: false
 jobs:
-  merge:
+  decide:
     runs-on: ubuntu-latest
-    timeout-minutes: 35
+    timeout-minutes: 5
+    permissions:
+      contents: read
+      pull-requests: write
+    outputs:
+      go: ${{ steps.gate.outputs.go }}
     steps:
       - id: meta
         uses: dependabot/fetch-metadata@25dd0e34f4fe68f24cc83900b1fe3fe149efef98 # v3.1.0
         with:
           github-token: ${{ github.token }}
-      - name: Wait for the Vercel build, then merge
+      - id: gate
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+          PR: ${{ github.event.pull_request.number }}
+          UPDATE_TYPE: ${{ steps.meta.outputs.update-type }}
+          NAMES: ${{ steps.meta.outputs.dependency-names }}
+        run: |
+          note() { gh pr comment "$PR" --repo "$REPO" --body "Security auto-merge: $1" >/dev/null || true; echo "$1"; echo "go=no" >> "$GITHUB_OUTPUT"; exit 0; }
+          gh api repos/scalusapp/scalus-ci-tools/contents/AUTOMERGE_OFF >/dev/null 2>&1 \
+            && note "switched off (AUTOMERGE_OFF in scalus-ci-tools), left for a person."
+          case "$UPDATE_TYPE" in
+            version-update:semver-patch|version-update:semver-minor) ;;
+            *) note "\`${UPDATE_TYPE:-unknown}\` ($NAMES) is not a patch or minor upgrade, left for a person." ;;
+          esac
+          echo "$NAMES" | tr ',' '\n' | grep -qE '^ *@(capacitor|capawesome)/' \
+            && note "touches the native app ($NAMES), needs a store build, left for a person."
+          echo "go=yes" >> "$GITHUB_OUTPUT"
+
+  build:
+    needs: decide
+    if: needs.decide.outputs.go == 'yes'
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          node-version: 24
+      - name: Install and build
+        env:
+          CI: "1"
+          NEXT_TELEMETRY_DISABLED: "1"
+        run: |
+          if [ -f package-lock.json ]; then npm ci --no-audit --no-fund; else npm install --no-audit --no-fund; fi
+          if node -e 'process.exit(require("./package.json").scripts?.["vercel-build"] ? 0 : 1)'; then npm run vercel-build
+          else npm run build --if-present; fi
+
+  merge:
+    needs: [decide, build]
+    if: always() && needs.decide.outputs.go == 'yes'
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    permissions:
+      contents: write
+      pull-requests: write
+    steps:
+      - name: Check the live site, then merge
         env:
           GH_TOKEN: ${{ github.token }}
           REPO: ${{ github.repository }}
           PR: ${{ github.event.pull_request.number }}
           SHA: ${{ github.event.pull_request.head.sha }}
-          UPDATE_TYPE: ${{ steps.meta.outputs.update-type }}
-          NAMES: ${{ steps.meta.outputs.dependency-names }}
           BASE: ${{ github.event.pull_request.base.ref }}
+          BUILD: ${{ needs.build.result }}
           VERCEL_TOKEN: ${{ secrets.VERCEL_AUTOMERGE_TOKEN }}
           VERCEL_PROJECT: ${{ secrets.VERCEL_PROJECT }}
           VERCEL_TEAM: ${{ secrets.VERCEL_TEAM }}
         run: |
           set -u
           note() { gh pr comment "$PR" --repo "$REPO" --body "Security auto-merge: $1" >/dev/null || true; echo "$1"; }
-          if gh api repos/scalusapp/scalus-ci-tools/contents/AUTOMERGE_OFF >/dev/null 2>&1; then
-            note "switched off (AUTOMERGE_OFF in scalus-ci-tools), left for a person."; exit 0; fi
-          case "$UPDATE_TYPE" in
-            version-update:semver-patch|version-update:semver-minor) ;;
-            *) note "\`$UPDATE_TYPE\` ($NAMES) is not a patch or minor upgrade, left for a person."; exit 0 ;;
-          esac
-          if echo "$NAMES" | tr ',' '\n' | grep -qE '^ *@(capacitor|capawesome)/'; then
-            note "touches the native app ($NAMES), needs a store build, left for a person."; exit 0; fi
-          # Vercel reports on the commit as a status ("Vercel") or a check run ("Vercel ...").
-          for i in $(seq 1 60); do
-            st=$(gh api "repos/$REPO/commits/$SHA/statuses" --jq '[.[]|select(.context|test("^Vercel";"i"))][0].state // ""') || { note "could not read the build status (the caller needs statuses: read and checks: read), left for a person."; exit 1; }
-            ck=$(gh api "repos/$REPO/commits/$SHA/check-runs" --jq '[.check_runs[]|select(.name|test("^Vercel";"i"))]|if length==0 then "" elif any(.conclusion=="failure" or .conclusion=="cancelled" or .conclusion=="timed_out") then "failure" elif all(.status=="completed") then "success" else "pending" end') || ck=""
-            s="${st:-$ck}"
-            [ "$st" = failure ] || [ "$st" = error ] || [ "$ck" = failure ] && { note "the Vercel preview build failed, left for a person."; exit 0; }
-            [ "$s" = success ] && break
-            sleep 30
-          done
-          [ "${s:-}" = success ] || { note "no Vercel build result after 30 minutes, left for a person."; exit 0; }
+          [ "$BUILD" = success ] || { note "the build failed (\`$BUILD\`), see the build job's log. Left for a person."; exit 0; }
           # The live site must be a git build of main (or of a commit main already contains).
           if [ -z "${VERCEL_TOKEN:-}" ] || [ -z "${VERCEL_PROJECT:-}" ]; then
             note "no live site check key (Dependabot secrets VERCEL_AUTOMERGE_TOKEN, VERCEL_PROJECT), left for a person."; exit 1; fi
@@ -76,4 +121,4 @@ jobs:
             *) note "the live site (${live:0:8}) is not contained in \`$BASE\` ($cmp), so merging would roll it back. Left for a person."; exit 0 ;;
           esac
           gh pr merge "$PR" --repo "$REPO" --squash --delete-branch --match-head-commit "$SHA" \
-            && echo "merged $NAMES ($UPDATE_TYPE)"
+            && echo "merged"
