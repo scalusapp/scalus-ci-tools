@@ -3,6 +3,9 @@
 # an advisory for a package we use; this merges it once the Vercel preview of that exact commit
 # has built, so the fix goes live by itself.
 #   Merged: patch and minor upgrades.
+#   Only when the live site is a git build of a commit main already contains. A site last deployed
+#   by hand, or live ahead of main, is never touched: merging would put old main live (22 Oct 2026,
+#   a push to a stale main took HQ and scalus.app's booking engine down for up to 30 minutes).
 #   Left open for a person: major upgrades, @capacitor/* and @capawesome/* (native app, needs a
 #   store build), a failed or missing Vercel build. Scalus Security shows anything left open.
 # Callers grant contents: write, pull-requests: write, statuses: read, checks: read.
@@ -10,6 +13,13 @@
 name: security-automerge
 on:
   workflow_call:
+    secrets:
+      VERCEL_AUTOMERGE_TOKEN:
+        required: false
+      VERCEL_PROJECT:
+        required: false
+      VERCEL_TEAM:
+        required: false
 jobs:
   merge:
     runs-on: ubuntu-latest
@@ -27,6 +37,10 @@ jobs:
           SHA: ${{ github.event.pull_request.head.sha }}
           UPDATE_TYPE: ${{ steps.meta.outputs.update-type }}
           NAMES: ${{ steps.meta.outputs.dependency-names }}
+          BASE: ${{ github.event.pull_request.base.ref }}
+          VERCEL_TOKEN: ${{ secrets.VERCEL_AUTOMERGE_TOKEN }}
+          VERCEL_PROJECT: ${{ secrets.VERCEL_PROJECT }}
+          VERCEL_TEAM: ${{ secrets.VERCEL_TEAM }}
         run: |
           set -u
           note() { gh pr comment "$PR" --repo "$REPO" --body "Security auto-merge: $1" >/dev/null || true; echo "$1"; }
@@ -48,5 +62,18 @@ jobs:
             sleep 30
           done
           [ "${s:-}" = success ] || { note "no Vercel build result after 30 minutes, left for a person."; exit 0; }
+          # The live site must be a git build of main (or of a commit main already contains).
+          if [ -z "${VERCEL_TOKEN:-}" ] || [ -z "${VERCEL_PROJECT:-}" ]; then
+            note "no live site check key (Dependabot secrets VERCEL_AUTOMERGE_TOKEN, VERCEL_PROJECT), left for a person."; exit 1; fi
+          proj=$(curl -sf -m 20 -H "Authorization: Bearer $VERCEL_TOKEN" "https://api.vercel.com/v9/projects/$VERCEL_PROJECT?teamId=$VERCEL_TEAM") \
+            || { note "could not read the live site from Vercel, left for a person."; exit 1; }
+          pb=$(echo "$proj" | jq -r '.link.productionBranch // ""')
+          live=$(echo "$proj" | jq -r '.targets.production.meta.githubCommitSha // ""')
+          [ "$pb" = "$BASE" ] || { note "Vercel ships production from \`${pb:-nothing}\`, not \`$BASE\`, left for a person."; exit 0; }
+          [ -n "$live" ] || { note "the live site was deployed by hand, so merging would put an older \`$BASE\` live. Left for a person."; exit 0; }
+          cmp=$(gh api "repos/$REPO/compare/$live...$BASE" --jq .status 2>/dev/null || echo unknown)
+          case "$cmp" in identical|ahead) ;;
+            *) note "the live site (${live:0:8}) is not contained in \`$BASE\` ($cmp), so merging would roll it back. Left for a person."; exit 0 ;;
+          esac
           gh pr merge "$PR" --repo "$REPO" --squash --delete-branch --match-head-commit "$SHA" \
             && echo "merged $NAMES ($UPDATE_TYPE)"
